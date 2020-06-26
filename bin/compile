@@ -1,0 +1,160 @@
+#!/bin/bash
+
+indent() {
+  sed -u 's/^/       /'
+}
+
+function major_version() {
+  echo $ELASTICSEARCH_VERSION | cut -d . -f 1
+}
+
+function minor_version() {
+  echo $ELASTICSEARCH_VERSION | cut -d . -f 2
+}
+
+function is_version_above() {
+  major=$1
+  minor=$2
+  if [[ ( "$(major_version)" -ge "${major}" && "$(minor_version)" -ge "${minor}" ) || "$(major_version)" -gt "${major}" ]]; then
+    echo 1
+  else
+    echo 0
+  fi
+}
+
+# if version >= 6.3, choose oss or x-pack depending on elasticsearch build from sniff
+function download_url() {
+  if [[ "$(is_version_above '6' '3')" == "1" && "${ELASTICSEARCH_FLAVOR}" == "oss" ]]; then
+    echo "https://artifacts.elastic.co/downloads/kibana/kibana-oss-${ELASTICSEARCH_VERSION}-linux-x86_64.tar.gz"
+  else
+    echo "https://artifacts.elastic.co/downloads/kibana/kibana-${ELASTICSEARCH_VERSION}-linux-x86_64.tar.gz"
+  fi
+}
+
+BUILD_DIR=$1
+CACHE_DIR=$2
+ENV_DIR=$3
+
+INIT_SCRIPT="$BUILD_DIR/.profile.d/kibana.sh"
+
+# If the user supplied a URL and the URL is not empty, use it
+if [ -f "$ENV_DIR/ELASTICSEARCH_URL" ] && [ ! -z "$ENV_DIR/ELASTICSEARCH_URL" ]; then
+  ELASTICSEARCH_URL="$(cat $ENV_DIR/ELASTICSEARCH_URL)"
+
+# If the user DID NOT supply a URL, or the URL they supplied is empty,
+# use BONSAI_URL if it is available
+elif [ -f "$ENV_DIR/BONSAI_URL" ]; then
+  ELASTICSEARCH_URL="$(cat $ENV_DIR/BONSAI_URL)"
+
+# Default to localhost for lack of anything else?
+else
+  ELASTICSEARCH_URL="http://localhost:9200"
+fi
+
+# Check for overridden elasticsearch version (For private clusters, etc)
+if [ -f "$ENV_DIR/ELASTICSEARCH_VERSION" ]; then
+  ELASTICSEARCH_VERSION=$(cat $ENV_DIR/ELASTICSEARCH_VERSION)
+  if [ -f "$ENV_DIR/ELASTICSEARCH_FLAVOR" ]; then
+    ELASTICSEARCH_FLAVOR=$(cat $ENV_DIR/ELASTICSEARCH_FLAVOR || echo -n 'oss')
+  else
+    ELASTICSEARCH_FLAVOR='oss'
+  fi
+else
+  echo "-----> Hitting Elasticsearch URL to detect version..."
+  # Query the ES URL and extract the version
+  DETAILS=$(curl --connect-timeout 5 -s $ELASTICSEARCH_URL)
+  if [ $? -ne 0 ]; then
+    echo "Unable to access $ELASTICSEARCH_URL, cannot install Kibana"
+    exit 1
+  fi
+  # Extract the version and flavor
+  ELASTICSEARCH_VERSION=$(echo $DETAILS | grep -m1 -oP '"number"\s*:\s*"\K[^"]+')
+  ELASTICSEARCH_FLAVOR=$(echo $DETAILS | grep -m1 -oP '"build_flavor"\s*:\s*"\K[^"]+')
+fi
+
+# Compose a URL to fetch kibana
+DOWNLOAD_URL=$(download_url)
+
+KIBANA_PACKAGE=${DOWNLOAD_URL##*/}
+case ${KIBANA_PACKAGE} in
+  *.tar.gz)
+    ;;
+  *)
+    echo "Only tar.gz is supported: $KIBANA_PACKAGE" | indent
+    exit 1
+    ;;
+esac
+KIBANA_DIR="$BUILD_DIR/kibana-${ELASTICSEARCH_VERSION}-linux-x86_64"
+
+echo "-----> Installing Kibana ${KIBANA_PACKAGE}..."
+
+mkdir -p ${INIT_SCRIPT%/*}
+mkdir -p $CACHE_DIR
+
+if [ ! -f "$CACHE_DIR/$KIBANA_PACKAGE" ]; then
+
+  echo "Downloading $KIBANA_PACKAGE from $DOWNLOAD_URL" | indent
+  curl -sLO $DOWNLOAD_URL
+
+  if [ $? -ne 0 ]; then
+    echo "Unable to fetch $DOWNLOAD_URL, cannot install Kibana"
+    exit 1
+  fi
+
+  # echo "Verifying against ${DOWNLOAD_URL}.sha1" | indent
+  # curl -sLO "${DOWNLOAD_URL}.sha1"
+  # echo "$(cat ${KIBANA_PACKAGE}.sha1) *${KIBANA_PACKAGE}" > ${KIBANA_PACKAGE}.sha1
+  # echo "Contents of the SHA1: " | indent
+  # cat ${KIBANA_PACKAGE}.sha1
+
+  # sha1sum --check --warn "${KIBANA_PACKAGE}.sha1"
+
+  if [ $? -eq 0 ]; then
+    mv $KIBANA_PACKAGE $CACHE_DIR
+  else
+    exit 1
+  fi
+fi
+
+echo "-----> Extracting Kibana ${KIBANA_PACKAGE}..."
+tar xz -C $BUILD_DIR --wildcards -f $CACHE_DIR/$KIBANA_PACKAGE
+
+echo "-----> Configuring Kibana @ ${KIBANA_DIR}..."
+
+# Check for username/password
+if [ ! -z "$(echo $ELASTICSEARCH_URL | egrep '://[a-zA-Z0-9]{1,}:[a-zA-Z0-9]{1,}@')" ]; then
+  UNAME="$(echo $ELASTICSEARCH_URL | egrep '://[a-zA-Z0-9]{1,}:[a-zA-Z0-9]{1,}@' | sed -E 's/.*:\/\/([a-zA-Z0-9]{1,}):([a-zA-Z0-9]{1,}).*/\1/')"
+  PWORD="$(echo $ELASTICSEARCH_URL | egrep '://[a-zA-Z0-9]{1,}:[a-zA-Z0-9]{1,}@' | sed -E 's/.*:\/\/([a-zA-Z0-9]{1,}):([a-zA-Z0-9]{1,}).*/\2/')"
+fi
+
+KIBANA_CONF="${CACHE_DIR}/kibana.yml"
+
+# Heroku doesn't like the default of localhost
+echo "server.host: 0.0.0.0" > $KIBANA_CONF
+
+if [ "$(is_version_above '6' '6')" == "1" ]; then
+  echo "elasticsearch.hosts: [\"${ELASTICSEARCH_URL}\"]" >> $KIBANA_CONF
+else
+  echo "elasticsearch.url: ${ELASTICSEARCH_URL}" >> $KIBANA_CONF
+fi
+
+if [ $UNAME != "" ]; then
+  echo "elasticsearch.username: ${UNAME}" >> $KIBANA_CONF
+  echo "elasticsearch.password: ${PWORD}" >> $KIBANA_CONF
+  if [ "$(major_version)" -ge "6" ]; then
+    echo "elasticsearch.requestHeadersWhitelist: [ authorization ]" >> $KIBANA_CONF
+  fi
+  echo "xpack.monitoring.elasticsearch.username:  ${UNAME}"
+  echo "xpack.monitoring.elasticsearch.username:  ${UNAME}"
+fi
+
+echo "-----> Configured Kibana"
+echo
+cat $KIBANA_CONF
+echo
+
+echo "-----> Applying configuration"
+mv -v $KIBANA_CONF $KIBANA_DIR/config/kibana.yml
+
+echo "-----> Exporting Path"
+echo 'export PATH="$PATH:'${KIBANA_DIR##*/}'/bin"' > $INIT_SCRIPT
