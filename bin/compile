@@ -145,7 +145,7 @@ if [ $UNAME != "" ]; then
     echo "elasticsearch.requestHeadersWhitelist: [ authorization ]" >> $KIBANA_CONF
   fi
   echo "xpack.monitoring.elasticsearch.username:  ${UNAME}"
-  echo "xpack.monitoring.elasticsearch.username:  ${UNAME}"
+  echo "xpack.monitoring.elasticsearch.password:  ${PWORD}"
 fi
 
 echo "-----> Configured Kibana"
